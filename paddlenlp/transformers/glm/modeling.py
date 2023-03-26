@@ -18,12 +18,15 @@ import math
 from functools import partial
 from typing import Optional
 
+
 import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
+import numpy as np
 from paddle import Tensor
 from paddle.distributed import fleet
 from paddle.distributed.fleet.utils import recompute
+from paddle.incubate.nn.functional import fused_multi_transformer
 
 from ...utils.converter import StateDictNameMapping
 from ...utils.env import CONFIG_NAME
@@ -265,6 +268,10 @@ class GLMStack(nn.Layer):
         self.enable_recompute = config.checkpoint_activations
         self.checkpoint_num_layers = config.checkpoint_num_layers
 
+        self.fuse_mt = config.fuse_mt
+        self.cache_kvs = []
+        self.config = config
+
         self.embedding_dropout = nn.Dropout(config.embedding_dropout_prob)
         self.block_position_encoding = config.block_position_encoding
 
@@ -291,6 +298,8 @@ class GLMStack(nn.Layer):
             self.layers.append(GLMBlock(config))
 
         self.final_layernorm = nn.LayerNorm(config.hidden_size, epsilon=config.layernorm_epsilon)
+        if self.fuse_mt:
+            self.__process_weight_for_fustmt()
 
     @paddle.jit.not_to_static
     def recompute_training(self, layer_module: nn.Layer, hidden_states: Tensor, ltor_mask: Tensor, cache: Tensor):
@@ -303,12 +312,77 @@ class GLMStack(nn.Layer):
         hidden_states = recompute(create_custom_forward(layer_module), hidden_states, ltor_mask, cache)
         return hidden_states
 
+    def __process_weight_for_fustmt(self):
+        qkv_weights, qkv_biases = [], []
+        out_weights, out_biases = [], []
+        ln_scales, ln_biases = [], []
+        ffn_ln_scales, ffn_ln_biases = [], []
+        ffn1_weights, ffn1_biases = [], []
+        ffn2_weights, ffn2_biases = [], []
+        num_attention_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+
+        for i in range(self.config.num_layers):
+
+            layer_i = self.layers[i]
+            ln_scale_0 = paddle.to_tensor(layer_i.input_layernorm.weight, stop_gradient=False).astype(paddle.float32)
+            ln_bias_0 = paddle.to_tensor(layer_i.input_layernorm.bias, stop_gradient=False).astype(paddle.float32)
+            #[num_head*head_dim, 3*num_head*head_dim] [hidden_size, 3 * hidden_size] => [head_dim, 3, num_attention_heads, hidden_size] 
+            qkv_weight_0 = paddle.to_tensor(layer_i.attention.query_key_value.weight, stop_gradient=False)
+            qkv_weight_0 = qkv_weight_0.reshape((self.config.hidden_size, 3, num_attention_heads, head_dim))
+            # [3, num_head, head_dim]
+            qkv_bias_0 = paddle.to_tensor(layer_i.attention.query_key_value.bias, stop_gradient=False)
+            qkv_bias_0 = qkv_bias_0.reshape((3, num_attention_heads, -1))
+            out_weight_0 = paddle.to_tensor(layer_i.attention.dense.weight, stop_gradient=False)
+            out_bias_0 = paddle.to_tensor(layer_i.attention.dense.bias, stop_gradient=False)
+
+            ffn_ln_scale_0 = paddle.to_tensor(layer_i.post_attention_layernorm.weight, stop_gradient=False).astype(paddle.float32)
+            ffn_ln_bias_0 = paddle.to_tensor(layer_i.post_attention_layernorm.bias, stop_gradient=False).astype(paddle.float32)
+
+            # [embed_dim, 4*embed_dim]
+            ffn1_weight_0 = paddle.to_tensor(layer_i.mlp.dense_h_to_4h.weight, stop_gradient=False)
+            ffn1_bias_0 = paddle.to_tensor(layer_i.mlp.dense_h_to_4h.bias, stop_gradient=False)
+            ffn2_weight_0 = paddle.to_tensor(layer_i.mlp.dense_4h_to_h.weight, stop_gradient=False)
+            ffn2_bias_0 = paddle.to_tensor(layer_i.mlp.dense_4h_to_h.bias, stop_gradient=False)
+
+            # TODO set bias ZERO
+            # qkv_bias_0.set_value(np.zeros(qkv_bias_0.shape, dtype=qkv_bias_0.dtype))
+            # out_bias_0.set_value(np.zeros(out_bias_0.shape, dtype=out_bias_0.dtype))
+
+            qkv_weights.append(qkv_weight_0)
+            qkv_biases.append(qkv_bias_0)
+            out_weights.append(out_weight_0)
+            out_biases.append(out_bias_0)
+            ffn_ln_scales.append(ffn_ln_scale_0)
+            ffn_ln_biases.append(ffn_ln_bias_0)
+            ffn1_weights.append(ffn1_weight_0)
+            ffn1_biases.append(ffn1_bias_0)
+            ffn2_weights.append(ffn2_weight_0)
+            ffn2_biases.append(ffn2_bias_0)
+            ln_scales.append(ln_scale_0)
+            ln_biases.append(ln_bias_0)
+        self.ln_scales = ln_scales
+        self.ln_biases = ln_biases
+        self.qkv_weights = qkv_weights
+        self.qkv_biases = qkv_biases
+        self.out_weights = out_weights
+        self.out_biases = out_biases
+        self.ln_scales = ln_scales
+        self.ffn_ln_scales = ffn_ln_scales
+        self.ffn_ln_biases = ffn_ln_biases
+        self.ffn1_weights = ffn1_weights
+        self.ffn1_biases = ffn1_biases
+        self.ffn2_weights = ffn2_weights
+        self.ffn2_biases = ffn2_biases
+
+
     def forward(
         self,
         hidden_states: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor,
         cache: Optional[Tensor] = None,
+        time_step = None,
         return_dict: bool = False,
     ):
         batch_size, query_length = hidden_states.shape[:2]
@@ -343,6 +417,8 @@ class GLMStack(nn.Layer):
                 attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
             attention_mask = attention_mask[:, :, :, -query_length - memory_length :]
 
+        attention_mask = (1 - attention_mask) * (-60000)
+        attention_mask = attention_mask.astype(hidden_states.dtype)
         if self.block_position_encoding:
             position_ids, block_position_ids = position_ids[:, 0], position_ids[:, 1]
         position_embeddings = self.position_embeddings(position_ids)
@@ -353,8 +429,52 @@ class GLMStack(nn.Layer):
             block_position_embeddings = self.block_position_embeddings(block_position_ids)
             hidden_states = hidden_states + block_position_embeddings
         hidden_states = self.embedding_dropout(hidden_states)
-
+        
         all_hidden_states = [hidden_states.detach()]
+        if self.fuse_mt:
+            if not cache and not self.cache_kvs:
+                num_attention_heads = self.config.num_attention_heads
+                head_dim = self.config.hidden_size // self.config.num_attention_heads
+                cache_kvs = []
+                cache_kv_size = (2, batch_size, num_attention_heads, query_length, head_dim)
+                cache_kv = paddle.zeros(cache_kv_size, dtype=hidden_states.dtype)
+                for i in range(self.config.num_layers):
+                    cache_kvs.append(cache_kv)
+                self.cache_kvs = cache_kvs
+
+            final_out, new_cache_kvs = fused_multi_transformer(
+                hidden_states,
+                self.ln_scales,
+                self.ln_biases,
+                self.qkv_weights,
+                self.qkv_biases,
+                self.out_weights,
+                self.out_biases,
+                self.ffn_ln_scales,
+                self.ffn_ln_biases,
+                self.ffn1_weights,
+                self.ffn1_biases,
+                self.ffn2_weights,
+                self.ffn2_biases,
+                pre_layer_norm=True,
+                epsilon=self.final_layernorm._epsilon,
+                cache_kvs=cache if cache else self.cache_kvs,
+                time_step=time_step,
+                attn_mask=attention_mask,
+                # attn_mask=None,
+                dropout_rate=0,
+                activation="gelu",
+                trans_qkvw=False,
+            )
+            final_out = self.final_layernorm(final_out)
+            return BaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=final_out,
+                # past_key_values=new_caches,
+                past_key_values=new_cache_kvs,
+                hidden_states=all_hidden_states,
+            )
+
+       
         for i, layer in enumerate(self.layers):
             mem_i = cache[i] if cache is not None else None
             has_gradient = not hidden_states.stop_gradient
@@ -663,6 +783,7 @@ class GLMModel(GLMPretrainedModel):
         position_ids: Tensor = None,
         attention_mask: Tensor = None,
         cache: Tensor = None,
+        time_step = None,
         return_dict: bool = True,
     ):
         batch_size = input_ids.shape[0]
@@ -677,7 +798,7 @@ class GLMModel(GLMPretrainedModel):
         if attention_mask is None:
             attention_mask = paddle.zeros([batch_size])
 
-        outputs = self.transformer(word_embeddings, position_ids, attention_mask, cache, return_dict)
+        outputs = self.transformer(word_embeddings, position_ids, attention_mask, cache, time_step, return_dict)
 
         if self.output_predict:
             if return_dict:
@@ -691,6 +812,7 @@ class GLMModel(GLMPretrainedModel):
                     hidden_states, self.word_embeddings.weight, self.config.tensor_parallel_output
                 )
             else:
+                hidden_states = outputs.last_hidden_state
                 logits = F.linear(hidden_states, self.word_embeddings.weight.T)
 
             if not return_dict:
@@ -730,9 +852,10 @@ class GLMForMultipleChoice(GLMPretrainedModel):
         choice_ids: Tensor = None,
         choice_indices: Tensor = None,
         labels: Tensor = None,
+        time_step: Tensor = None,
         return_dict: bool = None,
     ):
-        model_output = self.glm(input_ids, position_ids, attention_mask, return_dict=return_dict)
+        model_output = self.glm(input_ids, position_ids, attention_mask, time_step=time_step, return_dict=return_dict)
         lm_logits = model_output.logits if return_dict else model_output
         # [bs, seq_len, vocab]
         lm_logits = lm_logits[0] if isinstance(lm_logits, tuple) else lm_logits
@@ -825,11 +948,12 @@ class GLMForConditionalGeneration(GLMPretrainedModel):
         attention_mask: Tensor = None,
         labels: Tensor = None,
         cache: Tensor = None,
-        return_dict: bool = None,
+        time_step: Tensor = None,
+        return_dict: bool = True,
         loss_mask: Tensor = None,
         use_cache=True,
     ):
-        model_output = self.glm(input_ids, position_ids, attention_mask, cache=cache, return_dict=return_dict)
+        model_output = self.glm(input_ids, position_ids, attention_mask, cache=cache, time_step=time_step, return_dict=return_dict)
         if return_dict:
             lm_logits, cache = model_output.logits, model_output.past_key_values
         else:

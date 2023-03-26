@@ -121,6 +121,7 @@ GLM_PRETRAINED_INIT_CONFIGURATION = {
         "spell_func": "lstm",
         "spell_length": None,
         "vocab_size": 50048,
+        "fuse_mt": False,
     },
     "THUDM/glm-10b-chinese": {
         "attention_dropout_prob": 0.1,
@@ -145,6 +146,7 @@ GLM_PRETRAINED_INIT_CONFIGURATION = {
         "spell_length": None,
         "vocab_size": 50048,
         "bad_words_id": [50009],
+        "fuse_mt": False,
     },
 }
 
@@ -264,3 +266,4 @@ class GLMConfig(PretrainedConfig):
         self.paddle_dtype = paddle_dtype
         self.use_scaled_init_for_output_weights = use_scaled_init_for_output_weights
         self._fast_entry = None
+        self.fuse_mt = False

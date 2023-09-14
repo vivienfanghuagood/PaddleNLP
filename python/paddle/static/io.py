@@ -29,7 +29,6 @@ from paddle.fluid import (
     Variable,
     core,
     default_main_program,
-    program_guard,
     unique_name,
 )
 from paddle.fluid.executor import Executor, global_scope

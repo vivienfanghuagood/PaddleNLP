@@ -26,8 +26,6 @@
 constexpr static int NUM_INPUTS = 1;
 constexpr static int NUM_OUTPUTS = 1;
 using namespace paddle::inference::tensorrt;
-
-
 class TRTEngineOp {
 public:
   TRTEngineOp(const std::string& engine_file) {
@@ -144,6 +142,7 @@ public:
 
     for (int i = 0; i < num_bindings; ++i) {
       auto x_name = engine->getBindingName(i);
+      VLOG(0) << "process " << x_name;
       size_t input_index =
           std::find(input_name_list.begin(), input_name_list.end(), x_name) -
           input_name_list.begin();
@@ -168,10 +167,12 @@ public:
             break;
         }
         for (int i = 0; i < nb_dims; i++) {
-          ddim.push_back(dims.d[i]);
+          auto d = dims.d[i] > 0? dims.d[i]: batch_size;
+          ddim.push_back(d);
         }
         auto trt_type = engine->getTensorDataType(x_name);
         if (trt_type == nvinfer1::DataType::kFLOAT) {
+          VLOG(0) << "output dim is  " << ddim[0] << ", " << ddim[1] << ", " << ddim[2] << ", " << ddim[3] ;
           auto output = paddle::empty(ddim, paddle::DataType::FLOAT32, place);
           auto output_ptr = reinterpret_cast<void*>(output.data<float>());
           outputs.emplace_back(output);
@@ -181,8 +182,7 @@ public:
           auto output_ptr = reinterpret_cast<void*>(output.data<paddle::float16>());
           outputs.emplace_back(output);
           buffers[i] = output_ptr;
-        }
-        
+        } 
       }
     }
     engine_->Enqueue(trt_context, &buffers, cu_stream);
@@ -192,16 +192,17 @@ public:
 };
 
 std::vector<paddle::Tensor> trt_engine_forward(
-      const std::vector<paddle::Tensor>& inputs,
+      const paddle::Tensor& input,
       const std::string& engine_file,
       const std::string& names) {
     static TRTEngineOp op(engine_file);
+    std::vector<paddle::Tensor> inputs{input};
     auto input_name_list = TRTEngineOp::splitString(names, ';');
     return op.forward(inputs, input_name_list);
   }
 
 PD_BUILD_OP(trtengine_op)
-    .Inputs({"X", "X2"})
+    .Inputs({"X"})
     .Attrs({"engine_file: std::string", "names: std::string"})
     .Outputs({"Out"})
     .SetKernelFn(PD_KERNEL(trt_engine_forward));

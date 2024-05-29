@@ -67,6 +67,9 @@ setup(
             # Path to your own header files
             '/root/Paddle/build/third_party/install/glog/include',
         ],
+        libraries=[
+            'nvinfer',
+        ],
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": [

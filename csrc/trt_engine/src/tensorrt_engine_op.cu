@@ -182,7 +182,7 @@ public:
           auto output_ptr = reinterpret_cast<void*>(output.data<paddle::float16>());
           outputs.emplace_back(output);
           buffers[i] = output_ptr;
-        } 
+        }
       }
     }
     engine_->Enqueue(trt_context, &buffers, cu_stream);

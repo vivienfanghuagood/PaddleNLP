@@ -108,7 +108,7 @@ class PaddleToTensorRTConverter:
     
 
     def convert(self, network, paddle_op, inputs):
-        if paddle_op.name() == "pd_op.add":
+        if paddle_op.name() == "pd_op.add" or  paddle_op.name() == "pd_op.elementwise_add":
             weight_shape = paddle_op.operands()[1].source().shape
             weight_tensor = network.add_constant(weight_shape, inputs[1]).get_output(0)
             
@@ -126,6 +126,23 @@ class PaddleToTensorRTConverter:
             weight_tensor = network.add_constant(weight_shape, inputs[1]).get_output(0)
             out = network.add_matrix_multiply(inputs[0], trt.MatrixOperation.NONE, weight_tensor, trt.MatrixOperation.NONE)
             return out
+        if paddle_op.name() == "pd_op.conv2d":
+            strides = paddle_op.attrs()["strides"]
+            padding = paddle_op.attrs()["paddings"]
+            dilations = paddle_op.attrs()["dilations"]
+            actvation = paddle_op.attrs()["actvation"]
+            groups = paddle_op.attrs()["groups"]
+            out = network.add_convolution(
+                inputs[0],
+                weight_shape,
+                weight_tensor,
+                stride=strides,
+                padding=padding,
+                groups=groups,
+                dilations=dilations,
+                actvation=actvation
+            )
+            return out
         elif paddle_op.name() == "cf.yield":
             pass
         else:
@@ -139,7 +156,8 @@ class PaddleToTensorRTConverter:
 
 pass_attr_list = [
     {
-        'trt_sub_graph_extract_pass': {}
+        'trt_sub_marker_extract_pass': {},
+        'trt_sub_graph_extract_pass': {},
     },
 ]
 

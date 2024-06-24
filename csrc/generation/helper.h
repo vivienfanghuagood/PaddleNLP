@@ -18,7 +18,7 @@
 #include <cub/cub.cuh>
 #include <curand_kernel.h>
 
-constexpr int kBlockSize = 256; 
+constexpr int kBlockSize = 128; 
 constexpr int kNumWaves = 16; 
 
 inline cudaError_t GetNumBlocks(int64_t n, int* num_blocks) {

@@ -161,7 +161,7 @@ std::vector<paddle::Tensor> GetRoPE(const paddle::Tensor& input_ids,
     int32_t grid_size = 1; 
     GetNumBlocks(elem_cnt, &grid_size); 
     if (use_neox) {
-      fused_get_rotary_embedding_neox<<<grid_size, kBlockSize, 0, cu_stream>>> (
+      fused_get_rotary_embedding_neox<<<grid_size, 64, 0, cu_stream>>> (
           position_ids.data<int64_t>(),
           batch_size,
           max_seq_length,
@@ -172,7 +172,7 @@ std::vector<paddle::Tensor> GetRoPE(const paddle::Tensor& input_ids,
           elem_cnt,
           reinterpret_cast<float*>(rotary_embedding.data<float>()));
     } else {
-      fused_get_rotary_embedding<<<grid_size, kBlockSize, 0, cu_stream>>> (
+      fused_get_rotary_embedding<<<grid_size, 64, 0, cu_stream>>> (
           position_ids.data<int64_t>(),
           batch_size, 
           max_seq_length, 

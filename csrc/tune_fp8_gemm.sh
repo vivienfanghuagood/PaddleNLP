@@ -21,12 +21,21 @@
 #         >  tune_fp8_gemm.log 2>&1 &
 
 # llama3-8B
-nohup python ./utils/tune_cutlass_fp8_gemm.py \
+
+# qwen-1.5b
+python ./utils/tune_cutlass_fp8_gemm.py \
         --m_min 32 \
-        --m_max 32768 \
-        --n 4096 6144 \
-        --k 4096 14336 \
-        >  tune_fp8_gemm.log 2>&1 &
+        --m_max 4096 \
+        --n 2048 1536 17920 1536 \
+        --k 1536 1536 1536 8960 \
+        >  tune_fp8_gemm.log
+
+# nohup python ./utils/tune_cutlass_fp8_gemm.py \
+#         --m_min 32 \
+#         --m_max 32768 \
+#         --n 4096 6144 \
+#         --k 4096 14336 \
+#         >  tune_fp8_gemm.log 2>&1 &
 
 # nohup python ./utils/tune_cutlass_fp8_dual_gemm.py \
 #         --m_min 32 \

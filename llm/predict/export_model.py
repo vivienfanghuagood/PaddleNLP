@@ -22,7 +22,7 @@ from paddle.distributed import fleet
 from paddlenlp.trainer import PdArgumentParser
 from paddlenlp.trl import llm_utils
 
-from .predictor import ModelArgument, PredictorArgument, create_predictor
+from predictor import ModelArgument, PredictorArgument, create_predictor
 
 
 @dataclass

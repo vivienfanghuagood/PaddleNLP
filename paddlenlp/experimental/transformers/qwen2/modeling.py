@@ -559,7 +559,7 @@ class Qwen2InferenceModel(Qwen2PretrainedModel):
         self.norm.weight.set_value(paddle.to_tensor(state_dict["qwen2.norm.weight"]).cast(self.norm.weight.dtype))
 
         for idx in range(self.num_layers):
-            logger.info(f"set state for layer {idx}")
+            logger.debug(f"set state for layer {idx}")
 
             ln_scale = paddle.to_tensor(state_dict["qwen2.layers.{}.input_layernorm.weight".format(idx)]).cast(
                 self.transformer_block.ln_scales[idx].dtype

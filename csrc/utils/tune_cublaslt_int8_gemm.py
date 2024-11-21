@@ -16,28 +16,28 @@ import paddle
 from paddlenlp_ops import tune_cublaslt_gemm
 
 M_start = 1
-M_end = 32768
+M_end = 1024
 
 # llama3.1-8b
-k1 = [4096, 4096, 4096, 14336]
-n1 = [6144, 4096, 28672, 4096]
+# k1 = [4096, 4096, 4096, 14336]
+# n1 = [6144, 4096, 28672, 4096]
 
 # llama3.1-405b mp=8
-k2 = [16384, 16384, 16384, 6656]
-n2 = [2560, 16384, 13312, 16384]
+# k2 = [16384, 16384, 16384, 6656]
+# n2 = [2560, 16384, 13312, 16384]
 
 # qwen2-1.5b
 k3 = [1536, 1536, 1536, 8960]
 n3 = [2048, 1536, 17920, 1536]
 
 # qwen2-7b
-k4 = [3584, 3584, 3584, 18944]
-n4 = [4608, 3584, 37888, 3584]
+# k4 = [3584, 3584, 3584, 18944]
+# n4 = [4608, 3584, 37888, 3584]
 
-K_tensor = paddle.to_tensor(k1 + k2 + k3 + k4)
-N_tensor = paddle.to_tensor(n1 + n2 + n3 + n4)
+K_tensor = paddle.to_tensor(k3)
+N_tensor = paddle.to_tensor(n3)
 
-Path = "./cublaslt_gemm_search.csv"
+Path = "./qwen2-1.5b_l20_cuda12.2_cublaslt_gemm_search.csv"
 
 tune_cublaslt_gemm(K_tensor, N_tensor, M_start, M_end, "int8", True, False, Path)
 

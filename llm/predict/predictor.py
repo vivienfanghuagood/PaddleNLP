@@ -47,6 +47,8 @@ from paddlenlp.trl import llm_utils
 from paddlenlp.utils.import_utils import is_paddlenlp_ops_available
 from paddlenlp.utils.log import logger
 
+logger.set_level("ERROR")
+
 # Note(@RochardWooSJTU): MAX_BSZ must be the same as definition in get_output / save_output
 MAX_BSZ = 512
 
@@ -138,6 +140,7 @@ class PredictorArgument:
     total_max_length: int = field(
         default=4096, metadata={"help": "Super parameter. Maximum sequence length(encoder+decoder)."}
     )
+    chat_input: str = field(default="解释一下温故而知新", metadata={"help": "Chat input prompt"})
 
     def __post_init__(self):
         if self.append_attn:
@@ -1320,16 +1323,20 @@ def predict():
                     target_texts.append("")
 
     else:
-        source_texts = ["解释一下温故而知新"] * predictor_args.batch_size
+        source_texts = [predictor_args.chat_input] * predictor_args.batch_size
         target_texts = [""] * predictor_args.batch_size
 
     batch_source_texts = batchfy_text(source_texts, predictor_args.batch_size)
     batch_target_texts = batchfy_text(target_texts, predictor_args.batch_size)
 
+    import time
+    
     with open(model_args.output_file, "w", encoding="utf-8") as f:
         for bs, batch_source_text in enumerate(batch_source_texts):
             logger.info("Start predict")
+            s = time.perf_counter()
             outputs = predictor.predict(batch_source_text)
+            e = time.perf_counter()
             logger.info("End predict")
 
             if predictor.tensor_parallel_rank > 0:
@@ -1340,7 +1347,9 @@ def predict():
                 print("***********Target**********")
                 print(target)
                 print("***********Output**********")
+                
                 print(output)
+                print(f"\nellapse time: {e - s:.4f}s, tokens: {len(output)}, TPS: {len(output)/(e-s):.4f}")
                 out = {"src": source, "tgt": target, "output": output}
                 f.write(json.dumps(out, ensure_ascii=False) + "\n")
 

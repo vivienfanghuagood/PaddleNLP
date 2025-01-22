@@ -182,7 +182,7 @@ setup(
     name="paddlenlp_ops",
     ext_modules=CUDAExtension(
         sources=sources,
-        extra_compile_args={"cxx": ["-O3"], "nvcc": nvcc_compile_args},
+        extra_compile_args={"cxx": ["-O3", "-fpermissive", "-g"], "nvcc": nvcc_compile_args},
         libraries=["cublasLt"],
         library_dirs=[library_path],
     ),

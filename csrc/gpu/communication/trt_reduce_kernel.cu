@@ -1,7 +1,5 @@
 // reference: https://github.com/NVIDIA/TensorRT-LLM/blob/release/0.14/cpp/tensorrt_llm/kernels/customAllReduceKernels.h
 
-// #include <c10/cuda/CUDAStream.h>
-
 #include <cassert>
 #include <iostream>
 #include <sstream>
@@ -10,16 +8,22 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <vector>
+#include <string>
+#include <mutex>
+#include "cuda_ipc_utils.h"
+#include "helper.h"
 #include "trt_reduce_internal.cuh"
 
 using namespace trt_llm;
 
-void checkCudaError(cudaError_t err, const char* msg) {
-    if (err != cudaSuccess) {
-        std::cerr << msg << ": " << cudaGetErrorString(err) << "\n";
-        exit(EXIT_FAILURE);
-    }
-}
+
+#define CHECK_ERR(cmd) do { \
+    if (cmd == -1) { \
+        perror("Error: "); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
 
 using fptr_t = int64_t;
 
@@ -47,35 +51,7 @@ class AllReduceMeta {
 
 std::shared_ptr<AllReduceMeta> AllReduceMeta::instance = nullptr;
 
-#define NUM_PROCESSES 8
-struct SharedMemory {
-    fptr_t buffer_array[NUM_PROCESSES];
-    fptr_t barrier_in_array[NUM_PROCESSES];
-    fptr_t barrier_out_array[NUM_PROCESSES];
 
-    SharedMemory() {
-        for (int i = 0; i < NUM_PROCESSES; ++i) {
-            buffer_array[i] = -1;
-            barrier_in_array[i] = -1;
-            barrier_out_array[i] = -1;
-        }
-    }
-
-    void barrier(int world_size){
-        for(;;){
-        bool reduce_is_done = true;
-        for(int i=0; i< world_size; ++i){
-          if(this->buffer_array[i] == -1 || this->barrier_in_array[i] == -1 || this->barrier_out_array[i] == -1){
-            reduce_is_done = false;
-          }
-        }
-        if(reduce_is_done){
-          break;
-        }
-        usleep(1); // sleep 1ms
-      }
-    }
-};
 
 // Get the number of bits for a given data type.
 inline int get_bits(paddle::DataType dtype) {
@@ -96,21 +72,16 @@ inline bool CanApplyCustomAllReduce(int64_t num_elements, paddle::DataType dtype
   return num_elements % (16 / ((get_bits(dtype) + 7) / 8)) == 0;
 }
 
-void init_custom_ar(int64_t rank_id, int64_t world_size) {
-  
+void init_custom_ar(int rank_id, int world_size) {
   const int buffer_max_size = 8 * 1024 * 1024;
   const int barrier_max_size = 8 * (24 + 2) * 8;
   static std::mutex init_mutex;
   std::lock_guard<std::mutex> lock(init_mutex);
   if (!AllReduceMeta::instance) {
-    void* shared_memory = mmap(nullptr, sizeof(SharedMemory),
-                               PROT_READ | PROT_WRITE,
-                               MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    SharedMemory* shm = static_cast<SharedMemory*>(shared_memory);
-    if (shared_memory == MAP_FAILED) {
-        perror("mmap");
-        return;
-    }
+    
+    CUDA_CHECK(cudaSetDevice(rank_id));
+
+    SharedMemory* shm = (rank_id == 0) ? create_shared_memory() : open_shared_memory();
     
     void* buffers_ptr = nullptr;
     checkCudaError(cudaMalloc(&buffers_ptr, buffer_max_size), "cudaMalloc ptr error");
@@ -118,29 +89,39 @@ void init_custom_ar(int64_t rank_id, int64_t world_size) {
     checkCudaError(cudaMalloc(&barrier_in_ptr, barrier_max_size), "cudaMalloc ptr error");
     void* barrier_out_ptr = nullptr;
     checkCudaError(cudaMalloc(&barrier_out_ptr, barrier_max_size), "cudaMalloc ptr error");
-    cudaIpcMemHandle_t buffers_hanlder;
-    checkCudaError(cudaIpcGetMemHandle(&buffers_hanlder, buffers_ptr), "Failed to get buffers IPC memory handle");
-    cudaIpcMemHandle_t barrier_in_hanlder;
-    checkCudaError(cudaIpcGetMemHandle(&barrier_in_hanlder, barrier_in_ptr), "Failed to get barrier_in IPC memory handle");
-    cudaIpcMemHandle_t barrier_out_hanlder;
-    checkCudaError(cudaIpcGetMemHandle(&barrier_out_hanlder, barrier_out_ptr), "Failed to get barrier_out IPC memory handle");
 
-    shm->buffer_array[rank_id] = (fptr_t)&buffers_hanlder;
-    shm->barrier_in_array[rank_id] = (fptr_t)&barrier_in_hanlder;
-    shm->barrier_out_array[rank_id] = (fptr_t)&barrier_out_hanlder;
+    checkCudaError(cudaIpcGetMemHandle(&shm->buffers_handles[rank_id], buffers_ptr), "Failed to get buffers IPC memory handle");
+    checkCudaError(cudaIpcGetMemHandle(&shm->barrier_in_handles[rank_id], barrier_in_ptr), "Failed to get barrier_in IPC memory handle");
+    checkCudaError(cudaIpcGetMemHandle(&shm->barrier_out_handles[rank_id], barrier_out_ptr), "Failed to get barrier_out IPC memory handle");
+    shm->ready_flags[rank_id] = true;
+    
+    wait_for_ready_flags(shm, world_size);
 
     std::vector<fptr_t> buffers, barrier_in, barrier_out;
-    for(int i=0; i< world_size; ++i){
-      buffers.emplace_back(shm->buffer_array[i]);
-      barrier_in.emplace_back(shm->barrier_in_array[i]);
-      barrier_out.emplace_back(shm->barrier_out_array[i]);
-    }
 
-    shm->barrier(int(world_size));
+    for(int i=0; i< world_size; ++i){
+      if(i == rank_id){
+        buffers.emplace_back(reinterpret_cast<fptr_t>(buffers_ptr));
+        barrier_in.emplace_back(reinterpret_cast<fptr_t>(barrier_in_ptr));
+        barrier_out.emplace_back(reinterpret_cast<fptr_t>(barrier_out_ptr));
+      }
+      else{
+        void* other_buffer_handle_data;
+        CUDA_CHECK(cudaIpcOpenMemHandle(&other_buffer_handle_data, shm->buffers_handles[i], cudaIpcMemLazyEnablePeerAccess));
+        buffers.emplace_back(reinterpret_cast<fptr_t>(other_buffer_handle_data));
+
+        void* other_barrier_in_handle_data;
+        CUDA_CHECK(cudaIpcOpenMemHandle(&other_barrier_in_handle_data, shm->barrier_in_handles[i], cudaIpcMemLazyEnablePeerAccess));
+        barrier_in.emplace_back(reinterpret_cast<fptr_t>(other_barrier_in_handle_data));
+
+        void* other_barrier_out_handle_data;
+        CUDA_CHECK(cudaIpcOpenMemHandle(&other_barrier_out_handle_data, shm->barrier_out_handles[i], cudaIpcMemLazyEnablePeerAccess));
+        buffers.emplace_back(reinterpret_cast<fptr_t>(other_barrier_out_handle_data));
+      }
+    }
 
     AllReduceMeta::instance = std::make_shared<AllReduceMeta>(rank_id, world_size, buffers, barrier_in, barrier_out);
 
-    munmap(shared_memory, sizeof(SharedMemory));
   }
 }
 
@@ -149,7 +130,9 @@ void dispose(fptr_t _fa) {
   delete fa;
 }
 
-void all_reduce(const paddle::Tensor& inp, paddle::Tensor& out, int rank_id, int world_size) {
+std::vector<paddle::Tensor> all_reduce(const paddle::Tensor& inp, int rank_id, int world_size) {
+  auto out = paddle::empty_like(inp);
+
   if (!AllReduceMeta::instance) {
     init_custom_ar(rank_id, world_size);
   }
@@ -159,7 +142,6 @@ void all_reduce(const paddle::Tensor& inp, paddle::Tensor& out, int rank_id, int
   auto dtype = inp.type();
   AllReduceStrategyType strategy = SelectImplementation(num_elements * ((get_bits(dtype) + 7) / 8), m->world_size);
 
-  // should be gurantee in python code
   assert(strategy == AllReduceStrategyType::ONESHOT || strategy == AllReduceStrategyType::TWOSHOT);
   assert(CanApplyCustomAllReduce(num_elements, dtype));
 
@@ -172,7 +154,7 @@ void all_reduce(const paddle::Tensor& inp, paddle::Tensor& out, int rank_id, int
   params.local_input_buffer_ptr = const_cast<void *>(inp.data());
   params.local_output_buffer_ptr = out.data();
   params.elts_total = inp.numel();
-  params.elts_size = 2; // TODO for bfloat16 and float16
+  params.elts_size = get_bits(dtype) / 8;
   params.barrier_flag = ++(m->barrier_flag);
 
   for (int i = 0; i < world_size; ++i) {
@@ -187,6 +169,12 @@ void all_reduce(const paddle::Tensor& inp, paddle::Tensor& out, int rank_id, int
 
   auto data_type = out.type();
   trtCustomAllReduce(params, data_type, strategy, stream);
+  return {out};
+}
+
+std::vector<paddle::Tensor> all_reduce_fake(const paddle::Tensor& inp,  int rank_id, int world_size) {
+  auto out = paddle::empty_like(inp);
+  return {out};
 }
 
 std::vector<std::vector<int64_t>> TrtReduceInferShape(

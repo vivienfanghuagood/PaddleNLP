@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <tuple>
+#include <iostream>
 
 #include "trt_reduce_internal.cuh"
 
@@ -433,6 +434,8 @@ template <typename T>
 void invokeOneOrTwoShotAllReduceKernel(AllReduceParams& param, AllReduceStrategyType strat, cudaStream_t stream) {
   void* buffer = reinterpret_cast<void*>(param.peer_comm_buffer_ptrs[param.rank]);
   void* local_inp_buffer = param.local_input_buffer_ptr;
+  std::cout << "buffer address: " << buffer << std::endl;
+  std::cout << "local_inp_buffer address: " << local_inp_buffer << std::endl;
   CUDA_CHECK(
       cudaMemcpyAsync(buffer, local_inp_buffer, param.elts_total * param.elts_size, cudaMemcpyDeviceToDevice, stream));
 

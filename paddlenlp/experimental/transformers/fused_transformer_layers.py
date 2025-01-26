@@ -27,9 +27,9 @@ from paddle.incubate.nn.functional import (
     fused_moe,
     fused_rms_norm,
     masked_multihead_attention,
-    moe_dispatch,
-    moe_ffn,
-    moe_reduce,
+    # moe_dispatch,
+    # moe_ffn,
+    # moe_reduce,
     variable_length_memory_efficient_attention,
 )
 from paddle.nn import Layer
@@ -183,9 +183,15 @@ class MLAConfig:
     kv_a_layernorm_weight_attrs: List[paddle.ParamAttr] = None
     kv_b_proj_weight_attrs: List[paddle.ParamAttr] = None
     kv_b_proj_weight_scale_attrs: Optional[List[paddle.ParamAttr]] = None
+    kc_weight_attrs: Optional[List[paddle.ParamAttr]] = None
+    vc_weight_attrs: Optional[List[paddle.ParamAttr]] = None
+    use_absorb = False
 
     def use_mla(self) -> bool:
         return self.kv_lora_rank is not None
+    
+    def use_absorb(self) -> bool:
+        return self.use_absorb
 
     @property
     def qk_head_dim(self) -> int:
@@ -653,6 +659,8 @@ class FusedMultiTransformerBase(Layer):
         self.kv_a_proj_with_mqa_weights = []
         self.kv_a_layernorm_weights = []
         self.kv_b_proj_weights = []
+        self.w_kc_weights = []
+        self.w_vc_weights = []
 
         for i in range(self.num_layers):
             linear_weight_attr = self.get_attr(self.config.linear_weight_attrs, i)
@@ -698,6 +706,8 @@ class FusedMultiTransformerBase(Layer):
                 )
                 kv_a_layernorm_weight_attr = self.get_attr(self.config.mla_config.kv_a_layernorm_weight_attrs, i)
                 kv_b_proj_weight_attr = self.get_attr(self.config.mla_config.kv_b_proj_weight_attrs, i)
+                kc_weight_attr = self.get_attr(self.config.mla_config.kc_weight_attrs, i)
+                vc_weight_attr = self.get_attr(self.config.mla_config.vc_weight_attrs, i)
 
                 kv_a_proj_with_mqa_weight = self.create_parameter(
                     shape=self.kv_a_proj_with_mqa_weight_shape,
@@ -717,6 +727,19 @@ class FusedMultiTransformerBase(Layer):
                     dtype=self.create_params_type,
                     is_bias=False,
                 )
+                w_kc_weight = self.create_parameter(
+                    shape=self.w_kc_shape,
+                    attr=kc_weight_attr,
+                    dtype=self.create_params_type,
+                    is_bias=False,
+                )
+                w_vc_weight = self.create_parameter(
+                    shape=self.w_vc_shape,
+                    attr=vc_weight_attr,
+                    dtype=self.create_params_type,
+                    is_bias=False,
+                )
+                
             else:
                 qkv_weight_attr = self.get_attr(self.config.qkv_weight_attrs, i)
                 qkv_weight = self.create_parameter(
@@ -825,6 +848,8 @@ class FusedMultiTransformerBase(Layer):
                 self.kv_a_proj_with_mqa_weights.append(kv_a_proj_with_mqa_weight)
                 self.kv_a_layernorm_weights.append(kv_a_layernorm_weight)
                 self.kv_b_proj_weights.append(kv_b_proj_weight)
+                self.w_kc_weights.append(w_kc_weight)
+                self.w_vc_weights.append(w_vc_weight)
             else:
                 self.qkv_weights.append(qkv_weight)
 
@@ -848,6 +873,8 @@ class FusedMultiTransformerBase(Layer):
                 self._add_parameter(kv_a_proj_with_mqa_weight)
                 self._add_parameter(kv_a_layernorm_weight)
                 self._add_parameter(kv_b_proj_weight)
+                self._add_parameter(w_kc_weight)
+                self._add_parameter(w_vc_weight)
             else:
                 self._add_parameter(qkv_weight)
 
@@ -900,6 +927,12 @@ class FusedMultiTransformerBase(Layer):
             self.kv_b_proj_weight_shape = [
                 self.config.mla_config.kv_lora_rank,
                 self.num_heads * (self.config.mla_config.qk_nope_head_dim + self.config.mla_config.v_head_dim),
+            ]
+            self.w_kc_shape = [
+                self.num_heads, self.config.mla_config.qk_nope_head_dim, self.config.mla_config.kv_lora_rank
+            ]
+            self.w_vc_shape = [
+                self.num_heads, self.config.mla_config.v_head_dim, self.config.mla_config.kv_lora_rank
             ]
         else:
             self.qkv_weight_shape = (
@@ -958,8 +991,58 @@ class FusedMultiTransformerBase(Layer):
 
         return ln_out
 
+    def compute_qkv_linear_absorb(self, hidden_states, i):
+        q_len = hidden_states.shape[0]
+        num_local_heads = self.num_heads
+        kv_lora_rank = self.config.mla_config.kv_lora_rank
+        qk_rope_head_dim = self.config.mla_config.qk_rope_head_dim
+
+        q_input = paddle.empty(shape=[q_len, num_local_heads, kv_lora_rank+qk_rope_head_dim], dtype=hidden_states.dtype)
+
+        if self.config.mla_config.q_lora_rank is not None:
+
+            q = paddle.matmul(hidden_states, self.q_a_proj_weights[i])
+            q = self.norm_func(
+                x=q,
+                norm_weight=self.q_a_layernorm_weights[i],
+                norm_bias=None,
+                epsilon=self._epsilon,
+                begin_norm_axis=1,
+            )[0]
+            q = paddle.matmul(q, self.q_b_proj_weights[i])
+        else:
+            q = paddle.matmul(hidden_states, self.q_proj_weights[i])
+        q = q.reshape([-1, self.num_heads, self.config.mla_config.qk_head_dim])
+        q_nope, q_pe = paddle.split(
+            q, [self.config.mla_config.qk_nope_head_dim, self.config.mla_config.qk_rope_head_dim], axis=-1
+        )
+        q_nope_out = paddle.bmm(q_nope.transpose([1, 0]), self.w_kc_weights[i])
+        q_input[..., :kv_lora_rank] = q_nope_out.transpose([1, 0])
+
+        
+        latent_cache = paddle.matmul(hidden_states, self.kv_a_proj_with_mqa_weights[i])
+        v_input = latent_cache[..., :kv_lora_rank]
+        v_input = self.norm_func(
+            x=v_input,
+            norm_weight=self.kv_a_layernorm_weights[i],
+            norm_bias=None,
+            epsilon=self._epsilon,
+            begin_norm_axis=1,
+        )[0]
+        k_input = latent_cache.unsqueeze(1)
+        k_input[:, 0, : kv_lora_rank] = v_input
+        k_pe = k_input[..., kv_lora_rank:]
+
+        q_pe, k_pe = self.config.rotary_emb(self.position_ids, q_pe, k_pe)
+        q_input[..., kv_lora_rank :] = q_pe
+        k_input[..., kv_lora_rank :] = k_pe
+        return q_input, k_input, v_input
+
+
     def compute_qkv_linear(self, ln_out, i):
         if self.config.mla_config.use_mla():
+            if self.config.mla_config.use_absorb():
+                return self.compute_qkv_linear_absorb(ln_out, i)
             if self.config.mla_config.q_lora_rank is not None:
                 query = paddle.matmul(ln_out, self.q_a_proj_weights[i])
                 query = self.norm_func(

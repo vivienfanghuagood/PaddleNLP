@@ -24,6 +24,7 @@ from paddle.nn.quant import weight_quantize
 
 from paddlenlp.experimental.transformers.fused_transformer_layers import (
     FusedBlockMultiTransformer,
+    FusedMLAMultiTransformer,
     FusedBlockMultiTransformerWeightOnly,
     FusedMultiTransformerConfig,
     MLAConfig,
@@ -638,7 +639,6 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
                 kc_weight_tensor, vc_weight_tensor = kv_b_proj_weight.transpose([1, 0]).unflatten(0, (self.transformer_block.num_heads, -1)).split(num_or_sections=[_c.qk_nope_head_dim, _c.v_head_dim], axis=1)
                 self.transformer_block.w_kc_weights[idx].set_value(kc_weight_tensor)
                 self.transformer_block.w_vc_weights[idx].set_value(vc_weight_tensor)
-                # import pdb;pdb.set_trace()
 
             linear_weight = paddle.to_tensor(
                 state_dict[f"{self.base_model_prefix}.layers.{idx}.self_attn.o_proj.weight"]
@@ -779,7 +779,8 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
         if self.use_weight_only:
             self.transformer_block = FusedBlockMultiTransformerWeightOnly(transformer_config)
         else:
-            self.transformer_block = FusedBlockMultiTransformer(transformer_config)
+            # self.transformer_block = FusedBlockMultiTransformer(transformer_config)
+            self.transformer_block = FusedMLAMultiTransformer(transformer_config)
 
     def remove_padding(self, input_ids, seq_lens_this_time, draft_tokens=None, seq_lens_encoder=None):
         cum_offsets_now = paddle.cumsum(self.max_seq_len - seq_lens_this_time)
@@ -936,6 +937,14 @@ class DeepseekV2ForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, De
         Returns:
             list[paddle.Tensor]: the list tensor shape for cache
         """
+        if config.use_absorb:
+            cache_kvs = []
+            cache_kv_shape = [size + 1, 1, config.kv_lora_rank+config.qk_rope_head_dim]
+            
+            cache_kvs = [cache_kv_shape for _ in range(config.num_hidden_layers)]
+            return cache_kvs
+
+
         max_block_per_seq = (config.max_seq_len + config.block_size - 1) // config.block_size
         if max_batch_size == -1:
             max_block_nums = None

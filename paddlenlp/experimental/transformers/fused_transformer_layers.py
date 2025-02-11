@@ -39,6 +39,8 @@ from paddle.nn.quant import weight_only_linear
 from paddlenlp.utils.import_utils import is_paddlenlp_ops_available
 from paddlenlp.utils.log import logger
 
+from .triton_ops import extend_attention_fwd, decode_attention_fwd_grouped, create_flashinfer_kv_indices_triton
+
 if not is_paddlenlp_ops_available():
     logger.warning(
         "The paddlenlp_ops package is not installed. you can read the docs and install it by hand, "
@@ -644,6 +646,7 @@ class FusedMultiTransformerBase(Layer):
             self._add_parameter(cache_v_out_scale)
 
         self.dropout_rate = config.dropout_rate
+        self.forward_mode = "" # decoding; prefill; extend
 
     def init_weight(self):
         self.qkv_weights = []
@@ -1033,15 +1036,16 @@ class FusedMultiTransformerBase(Layer):
         k_input[:, 0, : kv_lora_rank] = v_input
         k_pe = k_input[..., kv_lora_rank:]
 
+        # import pdb;pdb.set_trace()
         q_pe, k_pe = self.config.rotary_emb(self.position_ids, q_pe, k_pe)
         q_input[..., kv_lora_rank :] = q_pe
         k_input[..., kv_lora_rank :] = k_pe
-        return q_input, k_input, v_input
+        return (q_input, k_input, v_input)
 
 
     def compute_qkv_linear(self, ln_out, i):
         if self.config.mla_config.use_mla():
-            if self.config.mla_config.use_absorb():
+            if self.config.mla_config.use_absorb() and self.forward_mode == "decoding":
                 return self.compute_qkv_linear_absorb(ln_out, i)
             if self.config.mla_config.q_lora_rank is not None:
                 query = paddle.matmul(ln_out, self.q_a_proj_weights[i])
@@ -1088,14 +1092,16 @@ class FusedMultiTransformerBase(Layer):
             key[..., : self.config.mla_config.qk_nope_head_dim] = key_nope
             key[..., self.config.mla_config.qk_nope_head_dim :] = key_pe
 
-            qkv_out = paddle.concat(
-                [
-                    query.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
-                    key.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
-                    value.reshape([-1, self.num_heads * self.config.mla_config.v_head_dim]),
-                ],
-                axis=-1,
-            )
+            # qkv_out = paddle.concat(
+            #     [
+            #         query.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
+            #         key.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
+            #         value.reshape([-1, self.num_heads * self.config.mla_config.v_head_dim]),
+            #     ],
+            #     axis=-1,
+            # )
+            # import pdb;pdb.set_trace()
+            return (query, key, value)
         else:
             qkv_out = paddle.matmul(ln_out, self.qkv_weights[i], False, True)
             if self.qkv_biases[i] is not None:
@@ -1287,7 +1293,7 @@ class FusedMultiTransformerBase(Layer):
 
             return scores
 
-        if self.config.moe_config.topk_method is not None:
+        if self.config.moe_config.topk_method is not None and False:
             gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
             # 应用各种策略后重塑的scores
             scores = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
@@ -1477,6 +1483,7 @@ class FusedMultiTransformerBase(Layer):
             Transformer layers, caches is inplace with input `caches`.
         """
         self.pre_process(**kwargs)
+        # import pdb;pdb.set_trace()
         kwargs["cum_offsets"] = cum_offsets
 
         if caches is not None:
@@ -2923,6 +2930,194 @@ class FusedBlockMultiTransformer(FusedMultiTransformerBase):
             fmha_out = fmha_out.reshape([-1, self.num_heads * self.config.mla_config.v_head_dim])
 
         out_linear_out = self.compute_out_linear(fmha_out, i)
+
+        return out_linear_out
+
+    def post_process(self, **kwargs):
+        multi_block_output = kwargs.get("multi_block_output", None)
+        cum_offsets = kwargs.get("cum_offsets", None)
+        seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
+        seq_lens_decoder = kwargs.get("seq_lens_decoder", None)
+        max_input_length = kwargs.get("max_input_length", -1)
+        output_padding_offset = kwargs.get("output_padding_offset", None)  # only used in speculative decoding
+
+        if self.config.speculate_config.return_full_hidden_states:
+            return multi_block_output
+        else:
+            out = rebuild_padding_v2(
+                multi_block_output,
+                cum_offsets,
+                seq_lens_decoder,
+                seq_lens_encoder,
+                output_padding_offset,
+                max_input_length,
+            )
+            return out
+
+
+class FusedMLAMultiTransformer(FusedMultiTransformerBase):
+    def __init__(self, config: FusedMultiTransformerConfig):
+        super().__init__(config)
+        self.MAX_BS = 256
+        self.scaling = self.config.mla_config.qk_head_dim**-0.5
+        # to tune
+        self.num_kv_splits = 8
+        self.kv_lora_rank = self.config.mla_config.kv_lora_rank
+    
+    def pre_process(self, **kwargs):
+        seq_lens_encoder = kwargs.get("seq_lens_encoder", None).cast("int64")
+        seq_lens_decoder = kwargs.get("seq_lens_decoder", None).cast("int64")
+        bs = seq_lens_encoder.shape[0]
+        bsz = bs
+
+        max_bs = 16 # TODO 
+        self.kv_indptr = paddle.zeros(
+            (max_bs + 1,), dtype=paddle.int32
+        )
+
+        time_step = kwargs.get("time_step", None)
+
+        # 处理 Encoder 部分
+        max_len_encoder = seq_lens_encoder.max().item()
+        encoder_ids = paddle.arange(max_len_encoder).tile([bsz, 1])  # 每个批次生成完整索引
+        encoder_mask = paddle.arange(max_len_encoder).unsqueeze(0) < seq_lens_encoder  # 根据 encoder 长度生成掩码
+        self.max_extend_len = max_len_encoder
+        encoder_ids = paddle.masked_select(encoder_ids, encoder_mask)  # 筛选有效的 Encoder 索引
+
+        # 生成批次索引用于保持顺序
+        encoder_batch_indices = paddle.repeat_interleave(
+            paddle.arange(bsz), seq_lens_encoder.squeeze(-1)
+        )  # 每个样本的索引重复对应的长度
+
+        # 处理 Decoder 部分
+        decoder_mask = seq_lens_decoder > 0  # 筛选非零 decoder 长度
+        decoder_ids = paddle.masked_select(seq_lens_decoder, decoder_mask)  # 提取非零 decoder 索引
+        decoder_batch_indices = paddle.masked_select(paddle.arange(bsz), decoder_mask.squeeze(-1))  # 提取有效的批次索引
+
+        all_ids = paddle.concat([encoder_ids, decoder_ids])
+        all_batch_indices = paddle.concat([encoder_batch_indices, decoder_batch_indices])
+
+        sorted_indices = paddle.argsort(all_batch_indices)
+        position_ids = paddle.gather(all_ids, sorted_indices)
+
+        self.position_ids = position_ids
+
+        kv_indptr = paddle.zeros((self.MAX_BS + 1,), dtype=paddle.int32)
+        qo_indptr = paddle.zeros((self.MAX_BS + 1,), dtype=paddle.int32)
+        self.seq_lens_sum = paddle.sum(seq_lens_encoder + seq_lens_decoder)
+        req_pool_indices = decoder_batch_indices
+
+        extend_prefix_lens = paddle.zeros([bs], dtype=paddle.int32)
+
+        if time_step:
+            # for decoding
+            self.forward_mode = "decoding"
+            max_extend_len = None
+
+            kv_indptr[1 : bs + 1] = paddle.cumsum(seq_lens_decoder, axis=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = paddle.empty(
+                [self.seq_lens_sum], dtype=paddle.int32
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                kwargs["block_tables"],
+                req_pool_indices,
+                seq_lens_decoder,
+                kv_indptr,
+                None,
+                kv_indices,
+                kwargs["block_tables"].strides[0],
+            )
+            
+
+            qo_indptr = None
+            custom_mask = None
+            mask_offsets = None
+        else:
+            self.forward_mode = "prefill"
+            # for prefill and extend
+            # for prefill, the kv_indptr is always zeros
+            # for extend, the kv_indptr is prefix length
+
+            kv_indptr[1 : bs + 1] = paddle.cumsum(
+                extend_prefix_lens, axis=0
+            ).squeeze()
+
+            kv_indices = paddle.zeros(
+                [bs+1],
+                dtype=paddle.int32,
+            )
+        self.kv_indices = kv_indices
+        self.kv_indptr = kv_indptr
+
+    def compute_out_linear(self, fmha_out, i):
+        fmha_out = fmha_out.reshape([fmha_out.shape[0], -1])
+        return paddle.matmul(fmha_out, self.linear_weights[i])
+
+    def compute_attn(
+        self,
+        time_step,
+        qkv_out,
+        padding_offset,
+        seq_lens,
+        input_ids,
+        rotary_embs,
+        rotary_emb_dims,
+        caches,
+        pre_caches,
+        pre_caches_length,
+        attn_mask,
+        i,
+        **kwargs,
+    ):
+        
+        q, k, v = qkv_out
+        B = q.shape[0]
+
+        o_shape = q.shape
+        o_shape[-1] = v.shape[-1]
+        o = paddle.empty(o_shape, dtype=q.dtype)
+
+
+        if time_step is None:
+            # update kv cache
+            # write_cache_kv(caches[i])
+            # self.kv_buffer[layer_id][loc] = cache_k
+            # caches[i][seq_lens] = k
+            extend_attention_fwd(
+                q,
+                k,
+                v,
+                o,
+                caches[i], # [max_seq_len, 1, 576]
+                caches[i][..., :self.kv_lora_rank], # [max_seq_len, 1, 512]
+                kwargs["cu_seqlens_q"],
+                self.kv_indptr,
+                self.kv_indices,
+                None,
+                None,
+                self.max_extend_len,
+                self.scaling,
+                0.0,
+            )
+        else:
+            # update kv cache
+            # caches[i][seq_lens] = k
+            decode_attention_fwd_grouped(
+                q,
+                caches[i],
+                caches[i][..., :self.kv_lora_rank],
+                o,
+                self.kv_indptr,
+                self.kv_indices,
+                attn_logits,
+                self.num_kv_splits,
+                self.scaling,
+                0.0,
+            )
+
+        
+        out_linear_out = self.compute_out_linear(o, i)
 
         return out_linear_out
 

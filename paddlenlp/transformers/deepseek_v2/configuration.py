@@ -218,6 +218,7 @@ class DeepseekV2Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.use_absorb = False
 
         super().__init__(
             pad_token_id=pad_token_id,

@@ -325,6 +325,59 @@ def merge_result(res, curr):
         res.append(curr)
     return res
 
+def process_single_item(each, dev_df, res):
+    pred, response, _ = single_request(None, each, dev_df, res)
+    return pred, response
+
+def evaluate_parallel(subjects):
+    import concurrent.futures
+
+    test_df, dev_df = load_mmlu_pro()
+    if not subjects:
+        subjects = list(test_df.keys())
+    print("assigned subjects", subjects)
+    
+    for subject in subjects:
+        test_data = test_df[subject]
+        output_res_path = os.path.join(args.output_dir, subject + "_result.json")
+        output_summary_path = os.path.join(args.output_dir, subject + "_summary.json")
+        res, category_record = update_result(output_res_path)
+
+        processed_ids = set(item.get("id") for item in res)
+
+        tasks = [each for each in test_data if each.get("id") not in processed_ids]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
+            futures = {executor.submit(process_single_item, each, dev_df, res): each for each in tasks}
+            
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Processing {subject}"):
+                each_original = futures[future]
+                try:
+                    pred, response = future.result()
+                except Exception as e:
+                    print(f"Error processing item: {e}")
+                    continue
+
+                each = each_original.copy()
+                label = each["answer"]
+                category = subject
+                each["pred"] = pred
+                each["model_outputs"] = response
+
+                merge_result(res, each)
+                
+                if category not in category_record:
+                    category_record[category] = {"corr": 0.0, "wrong": 0.0}
+                if pred == label:
+                    category_record[category]["corr"] += 1
+                else:
+                    category_record[category]["wrong"] += 1
+                
+                save_res(res, output_res_path)
+                save_summary(category_record, output_summary_path)
+
+        save_res(res, output_res_path)
+        save_summary(category_record, output_summary_path)
 
 def evaluate(subjects):
     # client = get_client()
@@ -340,13 +393,9 @@ def evaluate(subjects):
 
         k = 0
         for each in tqdm(test_data):
-            # k += 1
-            # if k % 10 != 0:
-            #     continue
             
             label = each["answer"]
             category = subject
-            # import pdb;pdb.set_trace()
             pred, response, exist = single_request(None, each, dev_df, res)
             if response is not None:
                 res, category_record = update_result(output_res_path)
@@ -355,7 +404,6 @@ def evaluate(subjects):
                 each["pred"] = pred
                 each["model_outputs"] = response
                 merge_result(res, each)
-                
                 if pred is not None:
                     if pred == label:
                         category_record[category]["corr"] += 1
@@ -363,7 +411,6 @@ def evaluate(subjects):
                         category_record[category]["wrong"] += 1
                 else:
                     category_record[category]["wrong"] += 1
-                # import pdb;pdb.set_trace()
                 save_res(res, output_res_path)
                 save_summary(category_record, output_summary_path)
                 res, category_record = update_result(output_res_path)
@@ -426,4 +473,4 @@ if __name__ == "__main__":
     else:
         assigned_subjects = args.assigned_subjects.split(",")
     os.makedirs(args.output_dir, exist_ok=True)
-    evaluate(assigned_subjects)
+    evaluate_parallel(assigned_subjects)

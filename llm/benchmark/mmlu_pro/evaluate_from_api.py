@@ -211,8 +211,7 @@ def call_generate(prompt, **kwargs):
     if kwargs['backend'] == 'paddle':
         data = {
             "text": prompt,
-            "max_dec_len": 2048,
-            # "min_dec_len": 1,
+            "max_dec_len": 4096,
             "topp": 0.95,
             "temperature": 0.6,
             "stream": True,
@@ -239,7 +238,7 @@ def call_generate(prompt, **kwargs):
             ],
             "top_p": 0.95,
             "temperature": 0.6,
-            "max_tokens": 2048,
+            "max_tokens": 4.96,
             "stream": False
         }
 
@@ -257,13 +256,13 @@ def call_generate(prompt, **kwargs):
         return json.loads(lines[-1])["choices"][0]["message"]["content"]
 
 def single_request(client, single_question, cot_examples_dict, exist_result):
-    exist = True
-    q_id = single_question["question_id"]
-    for each in exist_result:
-        if q_id == each["question_id"] and single_question["question"] == each["question"]:
-            pred = extract_answer(each["model_outputs"])
+    # exist = True
+    # q_id = single_question["question_id"]
+    # for each in exist_result:
+    #     if q_id == each["question_id"] and single_question["question"] == each["question"]:
+    #         pred = extract_answer(each["model_outputs"])
             
-            return pred, each["model_outputs"], exist
+    #         return pred, each["model_outputs"], exist
     exist = False
     category = single_question["category"]
     cot_examples = cot_examples_dict[category]
@@ -347,7 +346,7 @@ def evaluate_parallel(subjects):
 
         tasks = [each for each in test_data if each.get("id") not in processed_ids]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
             futures = {executor.submit(process_single_item, each, dev_df, res): each for each in tasks}
             
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Processing {subject}"):
@@ -453,6 +452,7 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, default="paddle")
     parser.add_argument("--ip", type=str, default="")
     parser.add_argument("--port", type=str, default="")
+    parser.add_argument("--parallel", type=int, default=128)
     parser.add_argument("--output_dir", "-o", type=str, default="eval_results/")
     parser.add_argument("--model_name", "-m", type=str, default="gpt-4",
                         choices=["gpt-4", "gpt-4o", "o1-preview",

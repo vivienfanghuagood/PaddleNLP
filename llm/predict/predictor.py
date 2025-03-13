@@ -235,7 +235,7 @@ class BasePredictor:
             self.generation_config = None
 
     def _preprocess(self, source):
-
+        # print("all model input: ", source)
         if self.tokenizer.chat_template is not None:
             # for str -> List[str] eg. "hello"
             # for List[str] -> List[str]  eg. ["hello", "hello new"]
@@ -247,6 +247,9 @@ class BasePredictor:
             if not isinstance(source, list) or not isinstance(source[0], str):
                 source = [source]
             source = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in source]
+
+        # import pdb;pdb.set_trace()
+        # print("all model input: ", source)
 
         tokenized_source = self.tokenizer(
             source,
@@ -514,6 +517,9 @@ class InferencePredictorMixin(BasePredictor):
             if not isinstance(source, list) or not isinstance(source[0], str):
                 source = [source]
             source = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in source]
+        import pdb;pdb.set_trace()
+        print("all model input: ", source)
+            
 
         inputs = llm_utils.dybatch_preprocess(
             self.tokenizer,

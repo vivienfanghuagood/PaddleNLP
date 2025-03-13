@@ -8,7 +8,7 @@ from datasets import load_dataset
 import argparse
 import requests
 
-API_KEY = ""
+API_KEY = "sk-48d58b79e19d454c95221b684e8f5c28"
 random.seed(12345)
 
 def get_client():
@@ -210,12 +210,27 @@ def call_generate(prompt, **kwargs):
     headers = {"Content-Type": "application/json"}
     if kwargs['backend'] == 'paddle':
         data = {
+            "model": "default",
             "text": prompt,
-            "max_dec_len": 4096,
-            "topp": 0.95,
+            "max_dec_len": 8192,
+            "top_p": 0.95,
             "temperature": 0.6,
             "stream": True,
+            # "penalty_score": 1.05,
             "return_all_tokens": False,
+            }
+    if kwargs['backend'] == 'paddle_origin':
+        data = {
+            "messages": 
+            [
+                {"role":"user","content": prompt}
+            ],
+            "top_p": 0.95,
+            "temperature": 0.6,
+            "max_tokens": 2048,
+            # "stream": True,
+            # "penalty_score": 1.05,
+            # "return_all_tokens": False,
             }
     elif kwargs['backend'] == 'trtllm':
          data = {
@@ -231,18 +246,19 @@ def call_generate(prompt, **kwargs):
         }
     elif kwargs['backend'] == 'vllm':
         data = {
-            "model": "/root/r1/models/",
+            "model": "Qwen/QwQ-32B",
             "messages": 
             [
                 {"role":"user","content": prompt}
             ],
             "top_p": 0.95,
             "temperature": 0.6,
-            "max_tokens": 4.96,
+            "max_tokens": 2048,
             "stream": False
         }
 
     response = requests.post(url, headers=headers, data=json.dumps(data))
+    
 
     chunks = []
     for chunk in response.iter_content(chunk_size=1000000):
@@ -251,10 +267,29 @@ def call_generate(prompt, **kwargs):
     lines = b"".join(chunks).decode("utf-8")
     lines = lines.strip().split('\n')
     if kwargs['backend'] == 'paddle':
+        # import pdb;pdb.set_trace()
         return json.loads(lines[-1])["tokens_all"]
     elif kwargs['backend'] == 'trtllm' or kwargs['backend'] == 'vllm':
+        # import pdb;pdb.set_trace()
+        return json.loads(lines[-1])["choices"][0]["message"]["content"]
+    elif kwargs['backend'] == "paddle_origin":
+        # import pdb;pdb.set_trace()
         return json.loads(lines[-1])["choices"][0]["message"]["content"]
 
+def call_generate_api(prompt):
+    from openai import OpenAI
+
+    client = OpenAI(api_key="sk-48d58b79e19d454c95221b684e8f5c28", base_url="https://api.deepseek.com")
+    response = client.chat.completions.create(
+        model="deepseek-reasoner",
+        messages=[
+            {"role": "user", "content": prompt},
+        ],
+        stream=False,
+        max_tokens=8192
+    )
+    return response.choices[0].message.content
+    
 def single_request(client, single_question, cot_examples_dict, exist_result):
     # exist = True
     # q_id = single_question["question_id"]
@@ -275,13 +310,19 @@ def single_request(client, single_question, cot_examples_dict, exist_result):
         prompt += format_example(each["question"], each["options"], each["cot_content"])
     input_text = format_example(question, options)
     try:
-        response = call_generate(prompt+input_text, ip=args.ip, port=args.port, backend=args.backend)
+        if args.backend == "api":
+            response = call_generate_api(prompt+input_text)
+        else:
+            response = call_generate(prompt+input_text, ip=args.ip, port=args.port, backend=args.backend)
+        # response = call_generate(prompt+input_text, ip=args.ip, port=args.port, backend=args.backend)
         response = response.replace('**', '')
+        # import pdb;pdb.set_trace()
     except Exception as e:
         print("error", e)
-        return None, None, exist
+        return None, None, exist, None
     pred = extract_answer(response)
-    return pred, response, exist
+    
+    return pred, response, exist, prompt+input_text
 
 
 def update_result(output_res_path):
@@ -325,8 +366,10 @@ def merge_result(res, curr):
     return res
 
 def process_single_item(each, dev_df, res):
-    pred, response, _ = single_request(None, each, dev_df, res)
-    return pred, response
+    # import pdb;pdb.set_trace()
+    pred, response, _, input_text = single_request(None, each, dev_df, res)
+    
+    return pred, response, input_text
 
 def evaluate_parallel(subjects):
     import concurrent.futures
@@ -337,6 +380,8 @@ def evaluate_parallel(subjects):
     print("assigned subjects", subjects)
     
     for subject in subjects:
+        if subject != "math":
+            continue
         test_data = test_df[subject]
         output_res_path = os.path.join(args.output_dir, subject + "_result.json")
         output_summary_path = os.path.join(args.output_dir, subject + "_summary.json")
@@ -352,7 +397,7 @@ def evaluate_parallel(subjects):
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Processing {subject}"):
                 each_original = futures[future]
                 try:
-                    pred, response = future.result()
+                    pred, response, input_text = future.result()
                 except Exception as e:
                     print(f"Error processing item: {e}")
                     continue
@@ -362,6 +407,7 @@ def evaluate_parallel(subjects):
                 category = subject
                 each["pred"] = pred
                 each["model_outputs"] = response
+                each["input_tokens"] = input_text
 
                 merge_result(res, each)
                 

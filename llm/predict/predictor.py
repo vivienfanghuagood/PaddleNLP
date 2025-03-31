@@ -262,6 +262,7 @@ class BasePredictor:
             add_special_tokens=self.tokenizer.chat_template is None
             or isinstance(self.tokenizer, (ChatGLMv2Tokenizer, ChatGLMTokenizer)),
         )
+        
         return tokenized_source
 
     @abstractmethod
@@ -962,10 +963,10 @@ class BlockInferencePredictorMixin(BasePredictor):
                 input_text += [""] * padding_len
                 assert len(input_text) == self.batch_size
 
-            if self.tokenizer.chat_template is not None:
-                if not isinstance(input_text, list) or not isinstance(input_text[0], str):
-                    input_text = [input_text]
-                input_text = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in input_text]
+            # if self.tokenizer.chat_template is not None:
+            #     if not isinstance(input_text, list) or not isinstance(input_text[0], str):
+            #         input_text = [input_text]
+            #     input_text = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in input_text]
 
             input_ids = []
             for text in input_text:
@@ -980,6 +981,7 @@ class BlockInferencePredictorMixin(BasePredictor):
                     or isinstance(self.tokenizer, (ChatGLMv2Tokenizer, ChatGLMTokenizer)),
                 )
                 input_ids.append(tokens["input_ids"][0])
+                
         else:
             assert isinstance(input_ids, list) and isinstance(input_ids[0], list), "input_ids must be a list of list"
             assert (
@@ -1062,13 +1064,19 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
         if model is None:
             raise ValueError("model should be provided for DygraphBlockInferencePredictor")
         self.cache_k_shapes, self.cache_v_shapes = model.get_cache_kvs_shape(model.config, config.batch_size)
+
         BlockInferencePredictorMixin.__init__(self, config, tokenizer, model)
 
         cachekv_dtype = self.dtype if config.cachekv_int8_type is None else "uint8"
 
         self.cache_kvs = []
         if self.cache_k_shapes and self.cache_v_shapes:
+            i = 0
             for cache_k_shape, cache_v_shape in zip(self.cache_k_shapes, self.cache_v_shapes):
+                i += 1
+                print("create cache kv ", i, " of ", len(self.cache_k_shapes), cache_k_shape, cache_v_shape)
+                
+                # import sys; sys.exit()
                 self.cache_kvs.append(paddle.zeros(cache_k_shape, dtype=cachekv_dtype))
                 self.cache_kvs.append(paddle.zeros(cache_v_shape, dtype=cachekv_dtype))
         else:
@@ -1103,6 +1111,7 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
         else:
             self.proposer = None
 
+
     @paddle.no_grad()
     def _infer(self, inputs: dict[str, paddle.Tensor]):
         return self.model.generate(
@@ -1128,17 +1137,17 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
             read_res_func = llm_utils.speculate_read_res
             output_tensor_shape = [MAX_BSZ * MAX_DRAFT_TOKENS + MAX_BSZ + 2, 1]
 
-        read_res_process = mp.Process(
-            target=read_res_func, args=[self.model_name_or_path, tensor_queue, result_queue, done_event]
-        )
-        if self.tensor_parallel_rank == 0:
-            read_res_process.start()
+        # read_res_process = mp.Process(
+        #     target=read_res_func, args=[self.model_name_or_path, tensor_queue, result_queue, done_event]
+        # )
+        # if self.tensor_parallel_rank == 0:
+        #     read_res_process.start()
 
-        output_tensor = paddle.full(shape=output_tensor_shape, fill_value=2, dtype="int64").cpu()
+        # output_tensor = paddle.full(shape=output_tensor_shape, fill_value=2, dtype="int64").cpu()
 
-        tensor_queue.put(output_tensor)
-        if self.tensor_parallel_rank == 0:
-            done_event.wait()
+        # tensor_queue.put(output_tensor)
+        # if self.tensor_parallel_rank == 0:
+        #     done_event.wait()
         s_time = time.time()
         while self.model_inputs["not_need_stop"]:
             # whether speculative decoding
@@ -1153,7 +1162,8 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
                 self.full_hidden_states = self._infer(self.model_inputs)
             else:
                 self._infer(self.model_inputs)
-        logger.info(f"running spend {time.time() - s_time}")
+        print(f"running spend {time.time() - s_time}")
+        
 
         if self.tensor_parallel_rank == 0:
             outputs = []
@@ -1289,24 +1299,27 @@ class StaticGraphBlockInferencePredictor(BlockInferencePredictorMixin):
         done_event = mp.Event()
 
         # whether speculative decoding
-        if self.proposer is None:
-            read_res_func = llm_utils.read_res
-            output_tensor_shape = [MAX_BSZ + 2, 1]
-        else:
-            read_res_func = llm_utils.speculate_read_res
-            output_tensor_shape = [MAX_BSZ * MAX_DRAFT_TOKENS + MAX_BSZ + 2, 1]
+        # if self.proposer is None:
+        #     read_res_func = llm_utils.read_res
+        #     output_tensor_shape = [MAX_BSZ + 2, 1]
+        # else:
+        #     read_res_func = llm_utils.speculate_read_res
+        #     output_tensor_shape = [MAX_BSZ * MAX_DRAFT_TOKENS + MAX_BSZ + 2, 1]
 
-        read_res_process = mp.Process(
-            target=read_res_func, args=[self.model_name_or_path, tensor_queue, result_queue, done_event]
-        )
-        if self.tensor_parallel_rank == 0:
-            read_res_process.start()
+        # read_res_process = mp.Process(
+        #     target=read_res_func, args=[self.model_name_or_path, tensor_queue, result_queue, done_event]
+        # )
+        # if self.tensor_parallel_rank == 0:
+        #     read_res_process.start()
 
-        output_tensor = paddle.full(shape=output_tensor_shape, fill_value=2, dtype="int64").cpu()
+        # output_tensor = paddle.full(shape=output_tensor_shape, fill_value=2, dtype="int64").cpu()
 
-        tensor_queue.put(output_tensor)
-        if self.tensor_parallel_rank == 0:
-            done_event.wait()
+        # tensor_queue.put(output_tensor)
+        # if self.tensor_parallel_rank == 0:
+        #     done_event.wait()
+        # 
+        outputs = []
+        output_tokens = []
         s_time = time.time()
         while self.model_inputs["not_need_stop"]:
             # whether speculative decoding
@@ -1320,18 +1333,26 @@ class StaticGraphBlockInferencePredictor(BlockInferencePredictorMixin):
             if self.return_full_hidden_states:
                 self.full_hidden_states = self.predictor.run(list(self.model_inputs.values()))[0]
             else:
-                self.predictor.run(list(self.model_inputs.values()))
+                # print("input: ", self.model_inputs["input_ids"])
+                self.model_inputs["input_ids"][self.model_inputs["input_ids"] > 151643] = 151643
+                
+                out = self.predictor.run(list(self.model_inputs.values()))
+                output_tokens.append(out)
+        
+        # import pdb;pdb.set_trace()  
+        # output_tokens = paddle.concat(output_tokens, axis=-1)
         logger.info(f"running spend {time.time() - s_time}")
+        return None, output_tokens
 
         if self.tensor_parallel_rank == 0:
-            outputs = []
-            output_tokens = []
-            while len(outputs) < self.batch_size:
-                result = result_queue.get(timeout=1)
-                outputs.append(result[-1])
-                output_tokens.append(result[-2])
+            # outputs = []
+            # output_tokens = []
+            # while len(outputs) < self.batch_size:
+                # result = result_queue.get(timeout=1)
+                # outputs.append(result[-1])
+                # output_tokens.append(result[-2])
 
-            read_res_process.terminate()
+            # read_res_process.terminate()
 
             if return_tokens:
                 return outputs, output_tokens
@@ -1425,11 +1446,11 @@ def create_predictor(
     from paddlenlp.utils.env import USE_FAST_TOKENIZER
 
     tokenizer = AutoTokenizer.from_pretrained(
-        predictor_args.model_name_or_path, padding_side="left", use_fast=USE_FAST_TOKENIZER
+        predictor_args.model_name_or_path, use_fast=True
     )
 
     # init chat_template for tokenizer
-    llm_utils.init_chat_template(tokenizer, predictor_args.model_name_or_path, predictor_args.chat_template)
+    # llm_utils.init_chat_template(tokenizer, predictor_args.model_name_or_path, predictor_args.chat_template)
 
     # TODO(wj-Mcat): fix llama tokenzier pad_token bug
     if (isinstance(tokenizer, (LlamaTokenizer, Llama3Tokenizer))) and not tokenizer.pad_token:
@@ -1550,7 +1571,7 @@ def predict():
 
     else:
         source_texts = [
-            "2014年3月，大范围雾霾天气长时间影响我国东部地区，严重危害人体健康。造成雾霾天气的人为原因有____\r\n①工业生产中使用矿物作为燃料，大量排放污染物     ②汽车尾气的大量排放     \r\n③风力小，空气流动不畅     ④冬季取暖排放粉尘\nA. ①②③\nB. ②③④\nC. ①③④\nD. ①②④"
+            "Given a word, you need to judge whether the usage of capitals in it is right or not.\n\n\n\nWe define the usage of capitals in a word to be right when one of the following cases holds:\n\nAll letters in this word are capitals, like \"USA\".\nAll letters in this word are not capitals, like \"leetcode\".\nOnly the first letter in this word is capital if it has more than one letter, like \"Google\".\n\nOtherwise, we define that this word doesn't use capitals in a right way.\n\n\n\nExample 1:\n\nInput: \"USA\"\nOutput: True\n\n\n\nExample 2:\n\nInput: \"FlaG\"\nOutput: False\n\n\n\nNote:\nThe input will be a non-empty word consisting of uppercase and lowercase latin letters.\n\n\nEnsure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT."
         ] * predictor_args.batch_size
         target_texts = [""] * predictor_args.batch_size
 

@@ -115,6 +115,7 @@ sources = [
     "./gpu/speculate_decoding_kernels/ngram_match.cc",
     "./gpu/speculate_decoding_kernels/speculate_save_output.cc",
     "./gpu/speculate_decoding_kernels/speculate_get_output.cc",
+    "./gpu/ops_pybind.cu",
 ]
 sources += find_end_files("./gpu/speculate_decoding_kernels", ".cu")
 
@@ -180,8 +181,12 @@ setup(
     name=ops_name,
     ext_modules=CUDAExtension(
         sources=sources,
-        extra_compile_args={"cxx": ["-O3"], "nvcc": nvcc_compile_args},
+        # extra_compile_args={"cxx": ["-O3"], "nvcc": nvcc_compile_args},
         libraries=["cublasLt"],
         library_dirs=[library_path],
+        extra_compile_args={
+            "cxx": ["-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"],
+            "nvcc": nvcc_compile_args,
+        },
     ),
 )
